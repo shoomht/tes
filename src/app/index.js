@@ -66,7 +66,7 @@ function setupRoutes(app, endpoints) {
       return { ...ep, url };
     });
     res.status(200).json({
-      title: "InuSoft API's.",
+      title: "ShunKazama API's.",
       description: "Welcome to the API documentation. This interactive interface allows you to explore and test our API endpoints in real-time.",
       baseURL,
       endpoints: enrichedEndpoints,
