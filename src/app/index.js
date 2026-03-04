@@ -3,7 +3,7 @@ import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
 
-import { startBot } from '../bot/bot.js';
+import { startBot, processUpdate } from '../bot/bot.js';
 import telegramNotif from '../middleware/telegramNotif.js';
 import logger from "../utils/logger.js";
 import loadEndpoints from "../utils/loader.js";
@@ -22,7 +22,16 @@ app.set("json spaces", 2);
 setupMiddleware(app);
 setupResponseFormatter(app);
 app.use(telegramNotif);
-startBot();
+
+// Webhook Telegram
+app.post('/webhook/telegram', express.json(), async (req, res) => {
+  res.sendStatus(200); // balas cepat ke Telegram
+  try {
+    await processUpdate(req.body);
+  } catch (e) {
+    console.error('[WEBHOOK] error:', e.message);
+  }
+});
 
 let allEndpoints = [];
 let isReady = false;
@@ -37,12 +46,11 @@ const initPromise = (async function initializeAPI() {
 
   setupRoutes(app, allEndpoints);
   isReady = true;
+  startBot(); // daftar webhook setelah server siap
 })();
 
 app.use(async (req, res, next) => {
-  if (!isReady) {
-    await initPromise;
-  }
+  if (!isReady) await initPromise;
   next();
 });
 
@@ -57,7 +65,6 @@ function setupRoutes(app, endpoints) {
       }
       return { ...ep, url };
     });
-
     res.status(200).json({
       title: "InuSoft API's.",
       description: "Welcome to the API documentation. This interactive interface allows you to explore and test our API endpoints in real-time.",
@@ -84,4 +91,3 @@ function setupRoutes(app, endpoints) {
 }
 
 export default app;
-    
