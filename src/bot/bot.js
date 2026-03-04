@@ -2,7 +2,7 @@ import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
 import https from 'https';
-import { exec } from 'child_process';
+import zlib from 'zlib';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -10,6 +10,7 @@ const __dirname = path.dirname(__filename);
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const WEBHOOK_URL = process.env.WEBHOOK_URL; // contoh: https://apikamu.vercel.app
 const API_DIR = path.join(process.cwd(), 'api');
 const ROOT_DIR = process.cwd();
 
@@ -93,13 +94,79 @@ async function downloadFile(fileId, destPath) {
   });
 }
 
-// ── Zip project ───────────────────────────────────────────────────────────────
+// ── Pure Node.js ZIP ──────────────────────────────────────────────────────────
 
-function zipProject(outputPath) {
-  return new Promise((resolve, reject) => {
-    const cmd = `cd "${ROOT_DIR}" && zip -qr "${outputPath}" . -x "node_modules/*" -x ".git/*" -x ".vercel/*" -x "*.log" -x ".env"`;
-    exec(cmd, err => err ? reject(err) : resolve());
-  });
+function u16LE(n) { const b = Buffer.alloc(2); b.writeUInt16LE(n); return b; }
+function u32LE(n) { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; }
+
+function crc32(buf) {
+  const table = [];
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let j = 0; j < 8; j++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    table[i] = c;
+  }
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < buf.length; i++) crc = table[(crc ^ buf[i]) & 0xFF] ^ (crc >>> 8);
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+function buildZip(files) {
+  const entries = [];
+  const central = [];
+  let offset = 0;
+  const d = new Date();
+  const date = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+  const time = (d.getHours() << 11) | (d.getMinutes() << 5) | Math.floor(d.getSeconds() / 2);
+
+  for (const { name, data } of files) {
+    const nameB = Buffer.from(name);
+    const compressed = zlib.deflateRawSync(data, { level: 6 });
+    const crc = crc32(data);
+    const localHeader = Buffer.concat([
+      Buffer.from([0x50, 0x4B, 0x03, 0x04]),
+      u16LE(20), u16LE(0), u16LE(8),
+      u16LE(time), u16LE(date),
+      u32LE(crc), u32LE(compressed.length), u32LE(data.length),
+      u16LE(nameB.length), u16LE(0), nameB,
+    ]);
+    entries.push(localHeader, compressed);
+    central.push(Buffer.concat([
+      Buffer.from([0x50, 0x4B, 0x01, 0x02]),
+      u16LE(20), u16LE(20), u16LE(0), u16LE(8),
+      u16LE(time), u16LE(date),
+      u32LE(crc), u32LE(compressed.length), u32LE(data.length),
+      u16LE(nameB.length), u16LE(0), u16LE(0), u16LE(0), u16LE(0), u32LE(0), u32LE(offset),
+      nameB,
+    ]));
+    offset += localHeader.length + compressed.length;
+  }
+
+  const centralBuf = Buffer.concat(central);
+  const eocd = Buffer.concat([
+    Buffer.from([0x50, 0x4B, 0x05, 0x06]),
+    u16LE(0), u16LE(0),
+    u16LE(central.length), u16LE(central.length),
+    u32LE(centralBuf.length), u32LE(offset), u16LE(0),
+  ]);
+  return Buffer.concat([...entries, centralBuf, eocd]);
+}
+
+function collectFiles(dir, base = '') {
+  const result = [];
+  const SKIP = ['node_modules', '.git', '.vercel'];
+  if (!fs.existsSync(dir)) return result;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (SKIP.includes(entry.name) || entry.name === '.env' || entry.name.endsWith('.log')) continue;
+    const fullPath = path.join(dir, entry.name);
+    const relName = base ? `${base}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      result.push(...collectFiles(fullPath, relName));
+    } else {
+      try { result.push({ name: relName, data: fs.readFileSync(fullPath) }); } catch {}
+    }
+  }
+  return result;
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -124,14 +191,12 @@ async function handleHelp(chatId) {
 async function handleList(chatId) {
   const categories = {};
   let total = 0;
-
   function scan(dir) {
     if (!fs.existsSync(dir)) return;
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        scan(full);
-      } else if (entry.name.endsWith('.js')) {
+      if (entry.isDirectory()) { scan(full); }
+      else if (entry.name.endsWith('.js')) {
         const cat = path.relative(API_DIR, dir) || 'root';
         if (!categories[cat]) categories[cat] = [];
         categories[cat].push(entry.name.replace('.js', ''));
@@ -139,11 +204,8 @@ async function handleList(chatId) {
       }
     }
   }
-
   scan(API_DIR);
-
   if (total === 0) return sendMessage('📭 Tidak ada endpoint aktif.', chatId);
-
   let msg = `📋 <b>Endpoint Aktif (${total} total)</b>\n\n`;
   for (const [cat, files] of Object.entries(categories)) {
     msg += `📁 <b>${cat}</b>\n`;
@@ -155,25 +217,22 @@ async function handleList(chatId) {
 
 async function handleDelete(chatId, args) {
   if (!args) return sendMessage('❌ Format: /delete &lt;kategori/nama&gt;\nContoh: /delete ai/gpt', chatId);
-
   const target = args.endsWith('.js') ? args : args + '.js';
   const fullPath = path.join(API_DIR, target);
-
-  if (!fs.existsSync(fullPath)) {
-    return sendMessage(`❌ File tidak ditemukan: <code>${target}</code>`, chatId);
-  }
-
+  if (!fs.existsSync(fullPath)) return sendMessage(`❌ File tidak ditemukan: <code>${target}</code>`, chatId);
   fs.unlinkSync(fullPath);
   await sendMessage(`✅ Endpoint <code>${target}</code> berhasil dihapus.\n⚠️ Redeploy untuk menerapkan perubahan.`, chatId);
 }
 
 async function handleBackup(chatId) {
   await sendMessage('⏳ Membuat backup...', chatId);
-  const zipPath = `/tmp/backup-${Date.now()}.zip`;
   try {
-    await zipProject(zipPath);
-    const { size } = fs.statSync(zipPath);
-    await sendDocument(zipPath, `📦 Backup REST API\n🕐 ${new Date().toISOString()}\n📦 ${(size / 1024 / 1024).toFixed(2)} MB`, chatId);
+    const files = collectFiles(ROOT_DIR);
+    const zipBuf = buildZip(files);
+    const zipPath = `/tmp/backup-${Date.now()}.zip`;
+    fs.writeFileSync(zipPath, zipBuf);
+    const sizeMB = (zipBuf.length / 1024 / 1024).toFixed(2);
+    await sendDocument(zipPath, `📦 Backup REST API\n🕐 ${new Date().toISOString()}\n📦 ${sizeMB} MB\n📄 ${files.length} files`, chatId);
     fs.unlinkSync(zipPath);
   } catch (err) {
     await sendMessage(`❌ Backup gagal: ${err.message}`, chatId);
@@ -183,12 +242,10 @@ async function handleBackup(chatId) {
 async function handleAddFile(chatId, document) {
   const fileName = document.file_name;
   if (!fileName.endsWith('.js')) return sendMessage('❌ Hanya file .js yang diterima.', chatId);
-
   await sendMessage(`⏳ Mengunduh <code>${fileName}</code>...`, chatId);
   try {
     const nameNoExt = fileName.replace('.js', '');
     let destPath;
-
     if (nameNoExt.includes('_')) {
       const [cat, ...rest] = nameNoExt.split('_');
       const name = rest.join('_');
@@ -198,37 +255,25 @@ async function handleAddFile(chatId, document) {
     } else {
       destPath = path.join(API_DIR, fileName);
     }
-
     await downloadFile(document.file_id, destPath);
     const rel = path.relative(API_DIR, destPath);
-    await sendMessage(
-      `✅ Endpoint ditambahkan!\n\n` +
-      `📄 <code>api/${rel}</code>\n\n` +
-      `⚠️ Redeploy untuk menerapkan perubahan.`,
-      chatId
-    );
+    await sendMessage(`✅ Endpoint ditambahkan!\n\n📄 <code>api/${rel}</code>\n\n⚠️ Redeploy untuk menerapkan perubahan.`, chatId);
   } catch (err) {
     await sendMessage(`❌ Gagal: ${err.message}`, chatId);
   }
 }
 
-// ── Update processor ──────────────────────────────────────────────────────────
+// ── Update processor (dipanggil dari webhook) ─────────────────────────────────
 
-async function processUpdate(update) {
+export async function processUpdate(update) {
   const msg = update.message;
   if (!msg) return;
-
   const chatId = String(msg.chat.id);
-  if (chatId !== String(CHAT_ID)) {
-    return sendMessage('⛔ Tidak diizinkan.', chatId);
-  }
-
+  if (chatId !== String(CHAT_ID)) return sendMessage('⛔ Tidak diizinkan.', chatId);
   if (msg.document) return handleAddFile(chatId, msg.document);
-
   const text = msg.text || '';
   const [cmd, ...rest] = text.trim().split(' ');
   const args = rest.join(' ').trim();
-
   switch (cmd.toLowerCase()) {
     case '/start':
     case '/help': return handleHelp(chatId);
@@ -240,31 +285,26 @@ async function processUpdate(update) {
   }
 }
 
-// ── Polling ───────────────────────────────────────────────────────────────────
+// ── Register webhook ke Telegram ──────────────────────────────────────────────
 
-let offset = 0;
-
-async function poll() {
-  if (!BOT_TOKEN) return;
-  try {
-    const res = await tgRequest('getUpdates', { offset, timeout: 30, limit: 10 });
-    if (res.ok && res.result.length > 0) {
-      for (const update of res.result) {
-        offset = update.update_id + 1;
-        processUpdate(update).catch(e => console.error('[BOT] error:', e.message));
-      }
-    }
-  } catch (e) {
-    console.error('[BOT] poll error:', e.message);
-  }
-  setTimeout(poll, 1000);
-}
-
-export function startBot() {
+export async function startBot() {
   if (!BOT_TOKEN || !CHAT_ID) {
     console.warn('[BOT] Bot tidak aktif — set TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID di .env');
     return;
   }
-  console.log('[BOT] Bot Telegram aktif...');
-  poll();
+  if (!WEBHOOK_URL) {
+    console.warn('[BOT] WEBHOOK_URL belum diset di .env');
+    return;
+  }
+  try {
+    const webhookPath = `${WEBHOOK_URL}/webhook/telegram`;
+    const res = await tgRequest('setWebhook', { url: webhookPath });
+    if (res.ok) {
+      console.log(`[BOT] Webhook terdaftar: ${webhookPath}`);
+    } else {
+      console.error('[BOT] Gagal daftar webhook:', res.description);
+    }
+  } catch (e) {
+    console.error('[BOT] startBot error:', e.message);
+  }
 }
