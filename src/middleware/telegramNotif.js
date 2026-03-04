@@ -1,4 +1,4 @@
-import { sendMessage } from './bot.js';
+import { sendMessage } from '../bot/bot.js';
 
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
